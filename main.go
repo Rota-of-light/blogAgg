@@ -14,6 +14,7 @@ import (
 	"encoding/xml"
 	"io"
 	"html"
+	"strconv"
 )
 
 import _ "github.com/lib/pq"
@@ -87,6 +88,62 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 		feed.Channel.Item[i].Description = html.UnescapeString(feed.Channel.Item[i].Description)
 	}
 	return &feed, nil
+}
+
+func scrapeFeeds(ctx context.Context, s *state) error {
+	feed, err := s.db.GetNextFeedToFetch(ctx)
+	if err != nil {
+		return err
+	}
+	params := database.MarkFeedFetchedParams{
+		LastFetchedAt: sql.NullTime{
+			Time:  time.Now(),
+			Valid: true,
+		},
+		ID: feed.ID,
+	}
+	err = s.db.MarkFeedFetched(ctx, params)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Fetching feed: %s\n", feed.Name)
+	realFeed, err := fetchFeed(ctx, feed.Url)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Saving %v posts.\n", realFeed.Channel.Title)
+	var params2 database.CreatePostParams
+	for _, item := range realFeed.Channel.Item {
+		publishedTime, err := time.Parse("Mon, 02 Jan 2006 15:04:05 MST", item.PubDate)
+		if err != nil {
+			log.Printf("Failed to parse PubDate for item: %s, error: %v", item.Title, err)
+			continue // Skip this item and move to the next
+		}
+		params2 = database.CreatePostParams{
+			ID:        uuid.New(),
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+			Title:     sql.NullString{
+				String: item.Title,
+				Valid:  true,
+			},
+			Url:	   item.Link,
+			Description: sql.NullString{
+				String: item.Description,
+				Valid:  true,
+			},
+			PublishedAt: sql.NullTime{
+				Time:  publishedTime,
+				Valid: true,
+			},
+			FeedID:	   feed.ID,
+		}
+		_, err = s.db.CreatePost(ctx, params2)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func middlewareLoggedIn(handler func(s *state, cmd command, user database.User) error) func(*state, command) error {
@@ -180,14 +237,21 @@ func handlerUsers(s *state, cmd command) error {
 }
 
 func handlerAgg(s *state, cmd command) error {
-	if len(cmd.args) != 0 {
-		return fmt.Errorf("No other statements needed when using the aggregator, for now.")
+	if len(cmd.args) != 1 {
+		return fmt.Errorf("Need to be given how much time between grabbing a new feed.")
 	}
-	feed, err := fetchFeed(context.Background(), "https://www.wagslane.dev/index.xml")
+	time_between_reqs, err := time.ParseDuration(cmd.args[0])
 	if err != nil {
-		return fmt.Errorf("Error when getting feed, error: %v", err)
+		return fmt.Errorf("Error with translating given string, possible incorrect syntax. Error: %v", err)
 	}
-	fmt.Printf("%+v\n", feed)
+	ticker := time.NewTicker(time_between_reqs)
+	fmt.Printf("Collecting feeds every %v\n", time_between_reqs)
+	for ; ; <-ticker.C {
+		forErr := scrapeFeeds(context.Background(), s)
+		if forErr != nil {
+			return fmt.Errorf("Error while getting feeds, Error: %v", forErr)
+		}
+	}
 	return nil
 }
 
@@ -297,6 +361,46 @@ func handlerUnfollow(s *state, cmd command, user database.User) error {
 	return nil
 }
 
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	if len(cmd.args) >= 2 {
+		return fmt.Errorf("Error: Command accepts at most one argument, which must be a postive whole number.")
+	}
+	var limit int32
+	if len(cmd.args) == 1 {
+		parsedLimit, err := strconv.Atoi(cmd.args[0])
+    	if err != nil {
+        	return fmt.Errorf("Error: Limit must be a whole number.")
+    	}
+		if parsedLimit <= 0 {
+			return fmt.Errorf("Error: Limit must be a positive whole number.")
+		}
+		limit = int32(parsedLimit)
+	} else {
+		limit = 2
+	}
+	params := database.GetPostsByUserParams{
+		UserID:	user.ID,
+		Limit:	limit,
+	}
+	userPosts, err := s.db.GetPostsByUser(context.Background(), params)
+	if err != nil {
+		return fmt.Errorf("Failed to retrieve posts for user %v: %w", user.Name, err)
+	}
+	if len(userPosts) == 0 {
+		fmt.Printf("No posts available for browsing.\n")
+		return nil
+	}
+	fmt.Printf("Now browsing the latest %d posts:\n", limit)
+	for _, post := range userPosts {
+		if post.Title.Valid {
+			fmt.Printf("	-%v\n\n", post.Title.String)
+		} else {
+			fmt.Printf("	-No Title\n\n")
+		}
+	}
+	return nil
+}
+
 func main() {
 	configInfo, err := config.Read()
 	if err != nil {
@@ -325,6 +429,7 @@ func main() {
 	cmds.register("follow", middlewareLoggedIn(handlerFollow))
 	cmds.register("following", middlewareLoggedIn(handlerFollowing))
 	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
+	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
 	if len(os.Args) <= 1 {
 		log.Fatal("Commands and arguments are required")
 	}
